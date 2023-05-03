@@ -1,45 +1,42 @@
-#include "dcp.h"
+#define FMT_HEADER_ONLY
+#include <fmt/core.h>
+
 #include <opencv2/imgproc.hpp>
+#include <utility>
 
-auto gray(cv::Mat bgr) -> cv::Mat
+#include "dcp.h"
+
+auto quadtree_subdivision( const cv::Mat& src,
+    const cv::Mat& integral, cv::Rect patch, u32 depth) -> cv::Rect;
+
+auto guided_filter(
+    const cv::Mat& guide, const cv::Mat& estimate, cv::Mat& dst, i32 radius, f32 epsilon) -> void;
+
+auto dark_channel(const cv::Mat& src, cv::Mat& dst, i32 size) -> void
 {
-    cv::Mat grayed(bgr.cols, bgr.rows, bgr.type());
-    cv::cvtColor(bgr, grayed, cv::COLOR_BGR2GRAY);
-    return grayed;
-}
+    cv::Mat channels[3]; // r, g, b
+    cv::split(src, channels);
 
-auto quadtree_subdivision(cv::Mat integral, cv::Rect patch, u32 depth) -> cv::Rect;
-auto guided_filter(cv::Mat guide, cv::Mat estimate, i32 radius, f64 epsilon) -> cv::Mat;
-
-auto dark_channel(cv::Mat bgr, i32 size) -> cv::Mat
-{
-    cv::Mat channels[3]; // b, g, r
-    cv::split(bgr, channels);
-
-    cv::Mat dark;
-    cv::min(channels[2], channels[1], dark); // dark <- min(r, g)
-    cv::min(channels[0], dark, dark); // dark <- min(b, dark)
+    cv::min(channels[2], channels[1], dst); // dst <- min(b, g)
+    cv::min(channels[0], dst, dst); // dst <- min(r, dst)
 
     if (size > 1) {
         cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, { size, size });
-        cv::erode(dark, dark, kernel, cv::Point(0, 0));
+        cv::erode(dst, dst, kernel, cv::Point(0, 0));
     }
-
-    return dark;
 }
 
-auto bright_patch(cv::Mat bgr, cv::Mat dark) -> cv::Rect
+auto bright_patch(const cv::Mat& src, const cv::Mat& dark) -> cv::Rect
 {
-    i32 H = bgr.rows, W = bgr.cols;
+    i32 H = dark.rows, W = dark.cols;
 
     cv::Mat darkIntg;
     cv::integral(dark, darkIntg, CV_32F);
 
-    auto patch = quadtree_subdivision(darkIntg, { 0, 0, W, H }, 5);
-    return patch;
+    return quadtree_subdivision(src, darkIntg, { 0, 0, W, H }, 4);
 }
 
-/*
+/**
  *   +-------+-------+
  *   |       |       |
  *   |   A   |   B   |
@@ -50,15 +47,16 @@ auto bright_patch(cv::Mat bgr, cv::Mat dark) -> cv::Rect
  *   |       |       |
  *   +------A+D---A+B+C+D
  */
-auto quadtree_subdivision(cv::Mat integral, cv::Rect patch, u32 depth) -> cv::Rect
+auto quadtree_subdivision(const cv::Mat& src,
+    const cv::Mat& integral, cv::Rect patch, u32 depth) -> cv::Rect
 {
-    if (depth == 0 || patch.width <= 1 || patch.height <= 1) {
+    if (depth <= 0 || patch.width <= 1 || patch.height <= 1) {
         return patch;
     }
 
-    std::array<std::pair<i32, i32>, 4> idx { { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } } };
+    const std::array<std::pair<i32, i32>, 4> idx { { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } } };
 
-    auto blockSum = [&](i32 x, i32 y, i32 w, i32 h) {
+    const auto blockSum = [&](i32 x, i32 y, i32 w, i32 h) {
         i32 x1 = x + w, y1 = y + h;
         return integral.at<f32>(y, x)
             - integral.at<f32>(y, x1)
@@ -84,84 +82,117 @@ auto quadtree_subdivision(cv::Mat integral, cv::Rect patch, u32 depth) -> cv::Re
         }
     }
 
-    return quadtree_subdivision(integral, { xMax, yMax, w2, h2 }, depth - 1);
+    auto lPatch = cv::Rect(xMax, yMax, w2, h2);
+    cv::rectangle(src, lPatch, cv::Scalar(0, 255, 0), 2);
+
+    return quadtree_subdivision(src, integral, lPatch, depth - 1);
 }
 
-auto transmission_estimate(cv::Mat bgr, cv::Scalar airlight, i32 size) -> cv::Mat
+auto transmission_estimate(
+    const cv::Mat& src, const cv::Scalar& airlight, cv::Mat& dst, i32 size) -> void
 {
-    cv::Mat estimate;
-    cv::divide(bgr, airlight, estimate);
+    auto [ar, ag, ab, _] = airlight.val;
+    cv::Scalar inv_airlight { 1 / ar, 1 / ag, 1 / ab };
+    {
+        // Timer timer([](auto d) { LOGI("RGB / A:  %lldms", d.count()); });
+        // cv::divide(rgb, airlight, estimate); // 12ms
+        cv::multiply(src, inv_airlight, dst); // 8ms
+    }
 
     // 1 - omega * Dark(est)
     f32 omega = 0.95f;
 
-    estimate = dark_channel(estimate);
-    cv::multiply(estimate, -1 * cv::Scalar(omega), estimate);
-    cv::add(estimate, cv::Scalar(1), estimate);
+    {
+        // Timer timer([](auto d) { LOGI("Dark(Est): %lldms", d.count()); });
+        dark_channel(dst, dst, size); // 5ms
+    }
 
-    return estimate;
+    cv::multiply(dst, -1 * cv::Scalar(omega), dst); // 2ms
+    cv::add(dst, cv::Scalar(1), dst); // 0ms
 }
 
-auto transmission_refine(cv::Mat bgr, cv::Mat estimate) -> cv::Mat
+auto transmission_refine(const cv::Mat& guide, const cv::Mat& estimate, cv::Mat& dst)
+    -> void
 {
-    cv::Mat gray;
-    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
-
-    return guided_filter(gray, estimate, 60, 1e-4);
+    i32 radius = 60;
+    f32 epsilon = 1e-4f;
+    guided_filter(guide, estimate, dst, radius, epsilon);
 }
 
-auto guided_filter(cv::Mat guide, cv::Mat estimate, i32 radius, f64 epsilon) -> cv::Mat
+auto guided_filter(
+    const cv::Mat& guide, const cv::Mat& estimate, cv::Mat& dst, i32 radius, f32 epsilon) -> void
 {
-    cv::Mat refined;
     cv::Size kSize(radius, radius);
 
     cv::Mat guideMean, estmMean, guideEstmMean;
-    cv::boxFilter(guide, guideMean, CV_32F, kSize);
-    //cv::imshow("guideMean", guideMean);
-    cv::boxFilter(estimate, estmMean, CV_32F, kSize);
-    //cv::imshow("estmMean", estmMean);
-    cv::boxFilter(guide.mul(estimate), guideEstmMean, CV_32F, kSize);
-    //cv::imshow("guideEstmMean", guideEstmMean);
-    cv::Mat guideEstmCovariance = guideEstmMean - guideMean.mul(estmMean);
-    //cv::imshow("guideEstmCovariance", guideEstmCovariance);
+    {
+        //Timer timer([&](auto d) { fmt::print("I_mean: %{}ms", d.count()); });
+        cv::boxFilter(guide, guideMean, CV_32F, kSize); // 3ms
+    }
+    {
+        //Timer timer([&](auto d) { fmt::print("p_mean: %{}ms", d.count()); });
+        cv::boxFilter(estimate, estmMean, CV_32F, kSize); // 3ms
+    }
+    {
+        //Timer timer([&](auto d) { fmt::print("Ip_mean: %{}ms", d.count()); });
+        cv::boxFilter(guide.mul(estimate), guideEstmMean, CV_32F, kSize); // 4ms
+    }
+
+    auto guideEstmCovariance = guideEstmMean - guideMean.mul(estmMean);
 
     cv::Mat guide2Mean;
-    cv::boxFilter(guide.mul(guide), guide2Mean, CV_32F, kSize);
-    //cv::imshow("guide2Mean", guide2Mean);
-    cv::Mat guideVariance = guide2Mean - guideMean.mul(guideMean);
-    //cv::imshow("guideVariance", guideVariance);
+    {
+        //Timer timer([&](auto d) { fmt::print("I2_mean: %{}ms", d.count()); });
+        cv::boxFilter(guide.mul(guide), guide2Mean, CV_32F, kSize); // 4ms
+    }
+    auto guideVariance = guide2Mean - guideMean.mul(guideMean);
 
-    cv::Mat a = guideEstmCovariance / (guideVariance + cv::Scalar(epsilon));
-    //cv::imshow("a", a);
+    cv::Mat a = guideEstmCovariance / (guideVariance + cv::Scalar(epsilon)); // 1ms
     cv::Mat b = estmMean - a.mul(guideMean);
-    //cv::imshow("b", b);
 
-    cv::boxFilter(a, a, CV_32F, kSize);
-    cv::boxFilter(b, b, CV_32F, kSize);
+    {
+        //Timer timer([&](auto d) { fmt::print("a_mean: %{}ms", d.count()); });
+        cv::boxFilter(a, a, CV_32F, kSize); // 3ms
+    }
+    {
+        //Timer timer([&](auto d) { fmt::print("b_mean: %{}ms", d.count()); });
+        cv::boxFilter(b, b, CV_32F, kSize); // 3ms
+    }
 
-    refined = a.mul(guide) + b;
-    //cv::imshow("refined", refined);
-    return refined;
+    dst = a.mul(guide) + b;
 }
 
-auto recover_image(cv::Mat bgr, cv::Mat transmissionMap, cv::Scalar airlight, f32 minMapVal) -> cv::Mat
+auto recover_image(
+    const cv::Mat& src, cv::Mat& transmissionMap, const cv::Scalar& airlight,
+    cv::Mat& dst, f32 minMapVal) -> void
 {
     transmissionMap = cv::max(transmissionMap, cv::Scalar::all(minMapVal));
 
     // (I - A) / t + A
 
-    cv::Mat recover;
-    cv::subtract(bgr, airlight, recover);
+    cv::subtract(src, airlight, dst);
 
-    //cv::divide(recover, estimate, recover);
-    std::array<cv::Mat, 3> channels;
-    cv::split(recover, channels);
-    for (auto& ch : channels) {
-        cv::divide(ch, transmissionMap, ch);
+    {
+        //cv::divide(recover, estimate, recover);
+        cv::Mat channels[3];
+        cv::split(dst, channels);
+        {
+            //Timer timer([&](auto d) { fmt::print("divide: {}ms", d.count()); });
+
+            // cv::parallel_for_(
+            //     { 0, 3 }, [&](auto rng) {
+            //         for (u32 i = rng.start; i < rng.end; i++) {
+            //             cv::divide(channels[i], transmissionMap, channels[i]);
+            //         }
+            //     }
+            // );
+
+            cv::divide(channels[0], transmissionMap, channels[0]);
+            cv::divide(channels[1], transmissionMap, channels[1]);
+            cv::divide(channels[2], transmissionMap, channels[2]);
+        }
+        cv::merge(channels, 3, dst);
     }
-    cv::merge(channels, recover);
 
-    cv::add(recover, airlight, recover);
-
-    return recover;
+    cv::add(dst, airlight, dst);
 }
